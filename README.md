@@ -2,6 +2,8 @@
 
 This repository is the official implementation of the [Social Processes paper](https://openreview.net/forum?id=qcjOWDHAc4J).
 
+<img src="imgs/architecture.png" alt="architecture" width="640"/>
+
 ## Requirements
 
 Dependencies can be installed in a conda environment using `environment.yml`:
@@ -12,18 +14,17 @@ conda env create -f environment.yml
 
 Note that some dependencies like the Blender3D `mathutils` package need to be installed with pip. In case the conda command above fails at first attempt, please try installing the packages listed under `pip` in the YAML file separately.
 
-## Organization
+## Code Organization
 
 Here's a brief overview of the main directories in this repo:
 
-- **artefacts/datasets** : contains the processed and synthesized features, splits, and context sequence indices for the Haggling and Synthetic Glancing datasets.ß
+- **artefacts/datasets** : contains the processed and synthesized features, splits, and context sequence indices for the Haggling and Synthetic Glancing datasets.
 - **data/**: contains code for data generation, preprocessing, loading, and custom type definition used throughout the codebase.
 - **lightning/**: contains the code for the lightning modules, callbacks, and custom classes used in their definition.
 - **models/**: contains pytorch code for the implementation of the components that constitute the Social Process and Neural Process models.
 - **run/**: contains executable scripts for constructing and processing data, and training and evaluating models.
 - **slurm/**: contains a convenience script for deploying tasks on a cluster.
 - **train/**: contains implementations of the loss modules.
-
 
 ## Training
 
@@ -42,9 +43,13 @@ relevant to a class are located in the class' implementation.
 
 ## Pre-trained Models
 
-You can download pretrained models here:
+The `artefacts/datasets` directory contains two subdirectories. The `panoptic-haggling` directory
+contains the processed features (`haggling-hbps.h5`), splits, training summary statistics for
+standandardization, and context sequence indices for both the *random* and *fixed-initial* regimes.
+The `synthetic` directory contains the data and context sequence indices for the
+Glancing Behavior experiments.
 
-- [My awesome model](https://drive.google.com/mymodel.pth) trained on ImageNet using parameters x,y,z.ß
+The `artefacts/pretrained-models` directory contains the 19 models used in the paper experiments.
 
 ## Contributing
 
