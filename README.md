@@ -1,6 +1,6 @@
 # Social Processes: Self-Supervised Forecasting of Nonverbal Cues in Social Conversations
 
-This repository is the official implementation of the [Social Processes paper](https://openreview.net/forum?id=qcjOWDHAc4J).
+This repository is the official implementation of the [Social Processes paper](https://arxiv.org/abs/2107.13576).
 
 <img src="imgs/architecture.png" alt="architecture" width="640"/>
 
@@ -51,6 +51,21 @@ Glancing Behavior experiments.
 
 The `artefacts/pretrained-models` directory contains the 19 models used in the paper experiments.
 
-## Contributing
+## License
 
 This repository (including all its contents) is available under the MIT license.
+
+## Bibtex
+
+If you use this repository for research, please cite
+
+```
+@misc{raman2021social,
+      title={Social Processes: Self-Supervised Forecasting of Nonverbal Cues in Social Conversations},
+      author={Chirag Raman and Hayley Hung and Marco Loog},
+      year={2021},
+      eprint={2107.13576},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
+}
+```
