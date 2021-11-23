@@ -39,7 +39,7 @@ python -m run.train_dataset --dataset_root mnm --data_file mnm-hbp.h5 --feature_
 
 ```
 # Haggling
-python -m run.train_dataset --dataset_root panoptic-haggling --data_file haggling-hbps.h5 --feature_set HBP --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 1e-5 --weight_decay 5e-4 --max_epochs 500 --train_all --dropout 0.25 --ndata_workers 4 --r_dim 64 --z_dim 64 [--pooler_nout 64] --override_hid_dims --hid_dim <dim for hidden layers> --out_dir <output directory>
+python -m run.train_dataset --dataset_root panoptic-haggling --data_file haggling-hbps.h5 --feature_set HBPS --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 1e-5 --weight_decay 5e-4 --max_epochs 500 --train_all --dropout 0.25 --ndata_workers 4 --r_dim 64 --z_dim 64 [--pooler_nout 64] --override_hid_dims --hid_dim <dim for hidden layers> --out_dir <output directory>
 ```
 
 For the other variants, the following additional options are needed :
