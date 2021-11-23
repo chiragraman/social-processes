@@ -1,13 +1,13 @@
 # Commands for Reproducing Paper Results
 
-In all the following commands, replace the text within `<>` with the appropriate argument. The following commands denote the choice of arguments for running the training and evaluation code for the experiments in the paper. The only difference between the commands for the baseline and proposed models is in the `--model` argument, along with the necessary `--component` argument for Social Process models:
+In all the following commands, replace the text within `<>` with the appropriate argument. The following commands denote the choice of arguments for running the training and evaluation code for the experiments in the paper. The only difference between the commands for the baseline and proposed models is in the `--model` argument, along with the necessary `--component` argument for the Social Process and Variational Encoder-Decoder models:
 
-- baselines: `--model NEURAL_PROCESS`
+- baselines: `--model NEURAL_PROCESS` or `--model VAE_SEQ2SEQ --comonent <MLP/RNN>`
 - proposed: `--model SOCIAL_PROCESS --comonent <MLP/RNN>`
 
-For simplicity, these are denoted as `[model arguments]` in the commands below. Replace the entire text with one of the two options above.
+For simplicity, these are denoted as `[model arguments]` in the commands below. Replace the entire text with one of the two options above. Additionally, the optional arguments are denoted within `[]`.
 
-## Forecasting Synthetic Glancing Behavior
+## Synthetic Glancing Behavior
 
 Training:
 
@@ -26,50 +26,50 @@ Evaluation:
 python -m run.run_toy_sine --gpus "0" --outdir <dir containing checkpoint> --future_len 10 [model arguments] --waves_file phased-sin-with-stops.npy --data_dim 1 --dropout 0.25 --skip_normalize_rot --ckpt_fname <checkpoint file name> --test
 ```
 
-## Haggling
+## Real-world Behavior
 
 Training:
 
-- *-latent*
+For the simplest *-latent* variants of the meta-learning models, the template commands for the datasets are as follows -
 
 ```
-python -m run.run_haggling --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 3e-5  --max_epochs 500 --fix_future_len --train_all --dropout 0.25 --reg 1e-6 --r_dim 64 --z_dim 64 --pooler_nout 64 --override_hid_dims --hid_dim 64 --out_dir <output directory>
+# MatchNMingle
+python -m run.train_dataset --dataset_root mnm --data_file mnm-hbp.h5 --feature_set HBP --gpus 1 --observed_len 4 --future_len 4 --max_future_offset 80 --fix_future_len --time_stride 20 --nposes 2 --data_dim 14 [model arguments] --lr 1e-5 --weight_decay 5e-4 --max_epochs 500 --train_all --dropout 0.25 --ndata_workers 4  --r_dim 64 --z_dim 64 [--pooler_nout 64] --override_hid_dims --hid_dim 64 --out_dir <output directory>
 ```
 
- - *-latent+det*
-
 ```
-python -m run.run_haggling --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 3e-5 --schedule_lr --max_epochs 500 --fix_future_len --train_all --dropout 0.25 --reg 1e-6 --r_dim 64 --z_dim 64 --pooler_nout 64 --override_hid_dims --hid_dim 64 --out_dir <output directory> --use_deterministic_path
-```
-
- - *-dot*
-
-```
-python -m run.run_haggling --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 3e-5 --max_epochs 500 --fix_future_len --train_all --dropout 0.25 --reg 1e-6 --r_dim 64 --z_dim 64 --pooler_nout 64 --override_hid_dims --hid_dim 64 --out_dir <output directory> --use_deterministic_path --attention_type DOT
+# Haggling
+python -m run.train_dataset --dataset_root panoptic-haggling --data_file haggling-hbps.h5 --feature_set HBP --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 1e-5 --weight_decay 5e-4 --max_epochs 500 --train_all --dropout 0.25 --ndata_workers 4 --r_dim 64 --z_dim 64 [--pooler_nout 64] --override_hid_dims --hid_dim <dim for hidden layers> --out_dir <output directory>
 ```
 
- - *-multihead*
+For the other variants, the following additional options are needed :
 
-```
-python -m run.run_haggling --gpus 1 --observed_len 60 --future_len 60 --max_future_offset 150 --time_stride 1 --nposes 2 --data_dim 15 [model arguments] --lr 3e-5 --max_epochs 500 --fix_future_len --train_all --dropout 0.25 --reg 1e-6 --r_dim 64 --z_dim 64 --pooler_nout 64 --override_hid_dims --hid_dim 64 --out_dir <output directory> --use_deterministic_path --attention_type MULTIHEAD --attention_rep RNN
-```
 
-For the MLP backbone models, use the arguments `--attention_rep MLP --attention_qk_dim <r_dim>`.
+ *-uniform* : `--use_deterministic_path`
+ *-dot* : `--use_deterministic_path --attention_type DOT`
+ *-mh* : `--use_deterministic_path --attention_type MULTIHEAD --attention_rep RNN`
+
+For the MLP backbone multihead attention models, use the arguments `--attention_rep MLP --attention_qk_dim <r_dim>`.
+
 
 Evaluation:
 
-```
-python -m run.run_haggling_test --gpus 1 --observed_len 60 --future_len 60 --fix_future_len --max_future_offset 150 --time_stride 1 --batch_size 128 [model arguments] --load_proc CKPT --ckpt_path <path to checkpoint> --project_rot --ndata_workers 4
-```
-
-The command writes the test metrics as a pickle file. As a convenience, the
-following command can be used to convert the metrics to a csv.
+The template evaluation commands are as follows:
 
 ```
-python -m run.summarize_metrics --metrics_path <path to the metrics file>
+# MatchNMingle
+python -m run.test_dataset --gpus 0 --dataset_root mnm --data_file mnm-hbp.h5 --feature_set HBP \
+    --observed_len 4 --future_len 4 --fix_future_len --max_future_offset 80 --time_stride 20 --batch_size 128 \
+    [model arguments] --ckpt_relpath <path to the checkpoint to load> \
+    --project_rot --ndata_workers 4 --results_dir <output directory>  [--context_regime FIXED]
 ```
 
+```
+# Haggling
+python -m run.test_dataset --gpus 1 --dataset_root panoptic-haggling --data_file haggling-hbps.h5 --feature_set HBPS \
+    --observed_len 60 --future_len 60 --fix_future_len --max_future_offset 150 --time_stride 1 --batch_size 128 \
+    [model arguments] --ckpt_relpath <path to the checkpoint to load> \
+    --project_rot --ndata_workers 4 --results_dir <output directory>  [--context_regime FIXED]
+```
 
-##### SLURM
-
-./slurm/train_panoptic.sh -n sp1024 -o $VAULT/social-processes/exp/sp/rnn/stoch-1024 -m run.run_panoptic -a " --component RNN --lr 1e-5 --schedule_lr --lr_steps 16 18 20 --max_epochs 500 --train_all --nlayers 1 --nz_layers 3 --r_dim 64 --z_dim 64 --pooler_nout 64 --override_hid_dim --hid_dim 1024 --weight_decay 1e-3 --batch_size 32"
+The command writes the test metrics as a pickle file and a summary of the metrics as a csv.
