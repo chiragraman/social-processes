@@ -45,7 +45,7 @@ relevant to a class are located in the class' implementation.
 The `artefacts/datasets` directory contains three subdirectories. The `panoptic-haggling`
 and `mnm` directories contain the processed features (suffixes `-hbps.h5` or `\hbp.h5`), splits, training summary statistics for standandardization, and context sequence indices for both the *random* and *fixed-initial* regimes. The `synthetic` directory contains the data and context sequence indices for the Glancing Behavior experiments.
 
-The `artefacts/pretrained-models` directory contains the 19 models used in the paper experiments.
+The `artefacts/pretrained-models` directory contains the models used in the paper experiments.
 
 ## License
 
