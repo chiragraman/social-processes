@@ -13,7 +13,6 @@ from typing import  NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 from torch.distributions import Normal
 
@@ -190,7 +189,7 @@ class SocialProcessSeq2Seq(nn.Module):
             r_context = self._encode_deterministic(context, samples.observed)
 
         # Get the predictive distribution of targets y*
-        future_mu, future_sigma = self.trg_encdec(
+        future_mu, future_sigma, encoded_rep  = self.trg_encdec(
             samples, z_samples, r_context, teacher_forcing
         )
         # Normalize the mean and std. rotation components of the predictions
@@ -199,7 +198,7 @@ class SocialProcessSeq2Seq(nn.Module):
             future_mu, future_sigma = self._normalize_rot(
                 future_mu, future_sigma
             )
-        return Normal(future_mu, future_sigma)
+        return Normal(future_mu, future_sigma), encoded_rep
 
     def forward(self, split: types.DataSplit, nz_samples: int = 1,
                 teacher_forcing: float = 0.5) -> types.Seq2SeqPredictions:
@@ -242,11 +241,11 @@ class SocialProcessSeq2Seq(nn.Module):
                 )
 
         # Predict by sampling from the encoded distribution
-        p_future = self._predict(trg, q, nz_samples, teacher_forcing,
-                                 ctx.observed)
+        p_future, encoded_rep = self._predict(trg, q, nz_samples, teacher_forcing, ctx.observed)
         return types.Seq2SeqPredictions(
             stochastic=p_future,
             posteriors=types.ApproximatePosteriors(q_context, q_target),
+            encoded_rep=encoded_rep,
             deterministic=(latent_path_futures, det_path_futures)
         )
 
@@ -263,8 +262,8 @@ class SocialProcessSeq2Seq(nn.Module):
             nz_samples  --  The number of z samples to use for estimation
         """
         q = self._encode_latent(context)
-        p_future = self._predict(samples, q, nz_samples, teacher_forcing=0,
-                                 context=context)
+        p_future, encoded_rep = self._predict(samples, q, nz_samples, teacher_forcing=0, context=context)
         return types.Seq2SeqPredictions(
-            stochastic=p_future, posteriors=types.ApproximatePosteriors(q)
+            stochastic=p_future, posteriors=types.ApproximatePosteriors(q),
+            encoded_rep=encoded_rep
         )

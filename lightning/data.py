@@ -14,25 +14,27 @@ import pickle
 import pandas as pd
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple, Type
+from typing import Optional, Sequence, Tuple, Type
 
 import pytorch_lightning as pl
-import torch
-from torch.utils.data import random_split, DataLoader
+from torch.utils.data import DataLoader
 
 from common.utils import EnumAction
 from data.datasets import (
-    SocialDatasetInterface, SocialDataset, SocialUnpairedContextDataset,
+    BUCKET_ATTR_NAME, SocialDatasetInterface, SocialDataset, SocialUnpairedContextDataset,
     SocialPairedContextDataset
 )
 from data.loader import (
-    COLLATE_TYPE, GroupSampler, collate_random_context,
+    COLLATE_TYPE, BucketSampler, collate_random_context, collate_seq2seq,
     collate_sampled_context, collate_unpaired_context, collate_paired_context
 )
-from data.preprocessing import PanopticBasicFeatures
-from data.types import (
-    ComponentType, ContextRegime, DataSplit, ModelType
-)
+from data.preprocessing import BASIC_FEATURES_COLUMNS
+from data.types import BucketType, ContextRegime, FeatureSet, ModelType
+
+
+# Map from feature set to the column names expected in the dataframe
+FEATURE_FIELDS_MAP = {FeatureSet.HBPS: BASIC_FEATURES_COLUMNS,
+                      FeatureSet.HBP: BASIC_FEATURES_COLUMNS[:-1]}
 
 
 # Column names to standardize
@@ -61,13 +63,13 @@ class SPSocialDataModule(pl.LightningDataModule):
 
     """ Setup the datasets and loaders for the Process Lightning Module """
 
-    def __init__(self, dataset_dir: Path, hparams: Namespace,
-                 test_batches: Optional[Sequence] = None) -> None:
+    def __init__(self, dataset_dir: Path, hparams: Namespace, test_batches: Optional[Sequence] = None) -> None:
         """ Initialize the data module
 
         Args:
             dataset_dir     --  The root dataset directory
             hparams         --  The arguments for preparing the data
+            feature_set     --  The feature set in the data
             test_batches    --  The fixed batch indices for the test
                                 sampler to control for random sampling
                                 across different model comparisons
@@ -76,6 +78,7 @@ class SPSocialDataModule(pl.LightningDataModule):
         super().__init__()
         self.data_dir = dataset_dir
         self.hparams = hparams
+        self.feature_set = hparams.feature_set
         self.train_set = None
         self.val_set = None
         self.test_set = None
@@ -108,13 +111,17 @@ class SPSocialDataModule(pl.LightningDataModule):
         std_train_df.loc[:, COLUMNS_TO_STDIZE] = std_train_df.loc[:, COLUMNS_TO_STDIZE].apply(
             lambda x: (x - x.mean()) / x.std(), axis=0
         )
-
         # Extract the val dataframe and standardize
         val_df = df.loc[df.group_id.isin(fold["val"])].copy()
         val_df.loc[:, COLUMNS_TO_STDIZE] = val_df.loc[:, COLUMNS_TO_STDIZE].apply(
             lambda x: (x - train_df[x.name].mean()) / train_df[x.name].std(),
             axis=0
         )
+
+        # Replace NaN values with 0; useful if datasets have 2D locations
+        # and the Z component is a constant
+        std_train_df.fillna(0, inplace=True)
+        val_df.fillna(0, inplace=True)
 
         return std_train_df, val_df
 
@@ -140,6 +147,9 @@ class SPSocialDataModule(pl.LightningDataModule):
             lambda x: (x - tr_desc.loc["mean", x.name]) / tr_desc.loc["std", x.name],
             axis=0
         )
+        # Replace NaN values with 0; useful if datasets have 2D locations
+        # and the Z component is a constant
+        test_df.fillna(0, inplace=True)
         return test_df
 
     def _init_fixed_ctx_set(
@@ -155,17 +165,17 @@ class SPSocialDataModule(pl.LightningDataModule):
         """ Initialize a random context dataset """
         return SocialDataset(df, self.hparams, feature_fields)
 
-    def init_datasets(self, stage: Optional[str] = None):
+    def init_datasets(self, stage: Optional[str] = None) -> None:
         """ Initialize the train, val, and test sets """
         # Set the feature columns to extract from the dataframes
-        feature_fields = PanopticBasicFeatures.feature_fields()
+        feature_fields = FEATURE_FIELDS_MAP[self.feature_set]
 
         if self.hparams.context_regime == ContextRegime.FIXED:
             # Choose the dataset type and collate function for the desired model
             if self.hparams.model == ModelType.SOCIAL_PROCESS:
                 dataset_cls = SocialUnpairedContextDataset
                 self.collate_fn = collate_unpaired_context
-            elif self.hparams.model == ModelType.NEURAL_PROCESS:
+            elif self.hparams.model in (ModelType.NEURAL_PROCESS, ModelType.VAE_SEQ2SEQ):
                 dataset_cls = SocialPairedContextDataset
                 self.collate_fn = collate_paired_context
             dataset_init = lambda x: self._init_fixed_ctx_set(
@@ -187,7 +197,7 @@ class SPSocialDataModule(pl.LightningDataModule):
             test_df = self.extract_test_groups(df)
             self.test_set = dataset_init(test_df)
 
-    def compute_samples(self, stage: Optional[str] = None):
+    def compute_samples(self, stage: Optional[str] = None) -> None:
         """ Compute observed, future pairs for the datasets """
         if stage == "fit" or stage is None:
             self.train_set.compute_samples(
@@ -198,18 +208,18 @@ class SPSocialDataModule(pl.LightningDataModule):
         if stage == "test" or stage is None:
             self.test_set.compute_samples(fix_future_len=True)
 
-    def setup(self, stage: Optional[str] = None):
+    def setup(self, stage: Optional[str] = None) -> None:
         """ Initialize the datasets and compute observed, future pairs """
         self.init_datasets(stage)
         self.compute_samples(stage)
 
     def _dataloader(
-            self, dataset: SocialDatasetInterface, collate_fn: COLLATE_TYPE,
-            fixed_batches: Optional[Sequence] = None
+            self, dataset: SocialDatasetInterface, bucket_type: BucketType,
+            collate_fn: COLLATE_TYPE, fixed_batches: Optional[Sequence] = None
         ) -> DataLoader:
         """ Stage agnostic data loader """
-        sampler = GroupSampler(dataset, self.hparams.batch_size,
-                               fixed_batches=fixed_batches)
+        sampler = BucketSampler(dataset, BUCKET_ATTR_NAME[bucket_type],
+                                self.hparams.batch_size, fixed_batches=fixed_batches)
         return DataLoader(
             dataset,
             batch_sampler=sampler,
@@ -219,14 +229,23 @@ class SPSocialDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         """ Construct the training data loader """
-        loader = None if self.train_set is None else \
-            self._dataloader(self.train_set, self.collate_fn)
+        loader = None
+        if self.train_set is not None:
+            if self.hparams.model != ModelType.VAE_SEQ2SEQ:
+                collate_fn = self.collate_fn
+            else:
+                # For meta-learning models, context is sampled as a subset of targets (batch).
+                # For the VAE_SEQ2SEQ models, no subsampling is required.
+                collate_fn = collate_seq2seq
+            loader = self._dataloader(
+                self.train_set, self.hparams.bucket_type, collate_fn
+            )
         return loader
 
     def val_dataloader(self):
         """ Construct the validation data loader """
         loader = None if self.val_set is None else \
-            self._dataloader(self.val_set, self.collate_fn)
+            self._dataloader(self.val_set, BucketType.GROUP, self.collate_fn)
         return loader
 
     def test_dataloader(self):
@@ -237,7 +256,7 @@ class SPSocialDataModule(pl.LightningDataModule):
         else:
             collate_fn = self.collate_fn
         loader = None if self.test_set is None else \
-            self._dataloader(self.test_set, collate_fn=collate_fn,
+            self._dataloader(self.test_set, BucketType.GROUP, collate_fn=collate_fn,
                              fixed_batches=self.test_batches)
         return loader
 
@@ -251,6 +270,9 @@ class SPSocialDataModule(pl.LightningDataModule):
                             help="filename for the train/val group keys (pkl)")
         parser.add_argument("--train_all", default=False, action="store_true",
                             help="use the entire training set ignoring folds")
+        parser.add_argument("--bucket_type", type=BucketType,
+                            action=EnumAction, default=BucketType.GROUP,
+                            help="policy to use for bucketing sequences while batching")
         parser.add_argument("--batch_size", type=int, default=128,
                             help="size of the mini-batch")
         parser.add_argument("--ndata_workers", type=int, default=2,
@@ -266,4 +288,6 @@ class SPSocialDataModule(pl.LightningDataModule):
         parser.add_argument("--test_context", type=float, default=0.5,
                             help="fraction of test batch to use as context. "
                                  "only used if context regime is random.")
+        parser.add_argument("--feature_set", type=FeatureSet, action=EnumAction,
+                            default=FeatureSet.HBPS, help="set of expected features")
         return parser

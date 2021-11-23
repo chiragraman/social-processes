@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import Sampler
 from torch.utils.data.dataloader import default_collate
 
-from .datasets import BucketMap, SocialDatasetInterface
+from .datasets import SocialDatasetInterface
 from .types import DataSplit, Seq2SeqSamples
 
 
@@ -57,6 +57,7 @@ def collate_seq2seq(batch: Sequence[Seq2SeqSamples]) -> Seq2SeqSamples:
         key=g_id, observed_start=obs_start, observed=obs,
         future_len=future_len, offset=offset, future=fut
     )
+
 
 def collate_random_context(
         batch: Sequence[Seq2SeqSamples], max_context: float = 0.8
@@ -167,15 +168,16 @@ def split_group(batch: Sequence[Seq2SeqSamples]) -> DataSplit:
     return DataSplit(context=context, target=target)
 
 
-class GroupSampler(Sampler):
+class BucketSampler(Sampler):
 
-    """ Sample batches of same seq_len and group size """
+    """ Sample batches by bucketing sequences by certain attributes """
 
     def __init__(
-            self, data_source: SocialDatasetInterface, batch_size: int,
-            min_batch_size: int = 5, fixed_batches: Optional[Sequence] = None
+            self, data_source: SocialDatasetInterface, bucket_map_attr: str,
+            batch_size: int, min_batch_size: int = 5, fixed_batches: Optional[Sequence] = None
         ) -> None:
         self.data_source = data_source
+        self.bucket_map_attr = bucket_map_attr
         self.batch_size = batch_size
         self.min_batch_size = min_batch_size
         self.fixed_batches = fixed_batches
@@ -189,7 +191,7 @@ class GroupSampler(Sampler):
     def compute_batches(self) -> List:
         """ Compute the list of batches """
         batches = []
-        for key, obs_map in self.data_source.bucket_map.items():
+        for key, obs_map in getattr(self.data_source, self.bucket_map_attr).items():
             # Shuffle order of observed sequences
             obs_seqs = copy.deepcopy(list(obs_map.values()))
             shuffle(obs_seqs)
@@ -208,7 +210,8 @@ class GroupSampler(Sampler):
             # If number of samples for current key is less than minimum
             # batch size, skip the current key
             if len(indices) < self.min_batch_size:
-                logging.info(f"[!] Not enough seqs for key {key} for batching")
+                logging.info(f"[!] Not enough seqs ({len(indices)}) for key {key} for batching; "
+                             f"min batch size = {self.min_batch_size}")
                 continue
             # Create batches from flattened indices
             for seqs in [indices[i:i+self.batch_size]

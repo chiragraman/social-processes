@@ -19,8 +19,7 @@ from torch.distributions.kl import kl_divergence
 from data.types import Seq2SeqPredictions
 
 
-def log_likelihood(normal: torch.distributions.Normal,
-                   target: Tensor) -> Tensor:
+def log_likelihood(normal: torch.distributions.Normal, target: Tensor) -> Tensor:
     """ Compute the log probability at the target given a normal distribution
 
     Take mean over the z_samples, target_len, and nsequences, and sum over
@@ -55,9 +54,8 @@ class SocialProcessSeq2SeqElbo(nn.Module):
         Returns the overall Elbo and the constituent NLL and KL terms
 
         """
-        p_future = pred.stochastic
         qs = pred.posteriors
-        loss = - log_likelihood(p_future, target_future)
+        loss = - log_likelihood(pred.stochastic, target_future)
         nll = loss.detach().clone() # important for preserving value
         kl = None
         if qs.q_target is not None:

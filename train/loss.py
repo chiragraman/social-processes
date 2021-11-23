@@ -17,9 +17,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from common.tensor_op import multi_range
-from data.types import Seq2SeqPredictions
-from data.types import DataSplit
+from data.types import DataSplit, FeatureSet, Seq2SeqPredictions
 from .elbo import SocialProcessSeq2SeqElbo
+
 
 class SocialProcessLoss(nn.Module):
 
@@ -54,38 +54,6 @@ class SocialProcessLoss(nn.Module):
             loss += aux_losses
             aux_losses = aux_losses.detach().clone()
         return loss, nll, kl, aux_losses
-
-
-class SocialAuxLoss(nn.Module):
-
-    """ Combine the geometric and speaking status losses
-
-    The homoscedastic loss is used to regress orientation and location while
-    binary cross-entropy with logits is computed for speaking status
-
-    """
-
-    def __init__(self, sx: float = 0, sq: float = -3, nposes: int = 1) -> None:
-        """ Initialize the loss module """
-        super().__init__()
-        self.geometric = GeometricHomoscedasticLoss(sx, sq, nposes)
-
-    def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
-        """ Compute the loss by weighting positional and rotational terms
-
-        Args:
-            prediction  --  The predicted features expected to be of shape
-                            (..., <(qw, qx, qy, qz, tx, ty, tz) * nposes, ss >)
-            target      --  The ground truth features expected to be of shape
-                            (..., <(qw, qx, qy, qz, tx, ty, tz) * nposes, ss >)
-        """
-        # Compute Geometric Loss
-        loss = self.geometric(prediction, target)
-        # Compute speaking status loss
-        loss += F.binary_cross_entropy_with_logits(
-            prediction[..., -1], target[..., -1]
-        )
-        return loss
 
 
 class GeometricHomoscedasticLoss(nn.Module):
@@ -131,3 +99,38 @@ class GeometricHomoscedasticLoss(nn.Module):
         weighted_loss = ((-1 * self.sx).exp() * loss_pos + self.sx
                          + (-1 * self.sq).exp() * loss_rot + self.sq)
         return weighted_loss
+
+
+class SocialAuxLoss(nn.Module):
+
+    """ Combine the geometric and speaking status losses
+
+    The homoscedastic loss is used to regress orientation and location while
+    binary cross-entropy with logits is computed for speaking status
+
+    """
+
+    def __init__(self, sx: float = 0, sq: float = -3, nposes: int = 1,
+                 feature_set : FeatureSet = FeatureSet.HBPS) -> None:
+        """ Initialize the loss module """
+        super().__init__()
+        self.geometric = GeometricHomoscedasticLoss(sx, sq, nposes)
+        self.feature_set = feature_set
+
+    def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        """ Compute the loss by weighting positional and rotational terms
+
+        Args:
+            prediction  --  The predicted features expected to be of shape
+                            (..., <(qw, qx, qy, qz, tx, ty, tz) * nposes, ss (optional)>)
+            target      --  The ground truth features expected to be of shape
+                            (..., <(qw, qx, qy, qz, tx, ty, tz) * nposes, ss (optional)>)
+        """
+        # Compute Geometric Loss
+        loss = self.geometric(prediction, target)
+        if self.feature_set == FeatureSet.HBPS:
+            # Compute speaking status loss
+            loss += F.binary_cross_entropy_with_logits(
+                prediction[..., -1], target[..., -1]
+            )
+        return loss

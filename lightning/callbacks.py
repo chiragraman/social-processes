@@ -28,7 +28,7 @@ from torch.distributions import Normal
 
 from common.tensor_op import multi_range
 from data.types import (
-    DataSplit, Seq2SeqSamples, Seq2SeqPredictions, SerializationMap
+    DataSplit, FeatureSet, Seq2SeqSamples, Seq2SeqPredictions, SerializationMap
 )
 
 
@@ -69,19 +69,14 @@ class TestSequenceProcessor(Callback):
             self, outputs: Seq2SeqPredictions, target: Seq2SeqSamples
         ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """ Yield each indivudual test input sequence and prediction
-
         Takes a mean over all z samples in the prediction, and assumed ground
         truth future to be present.
-
         Input samples consist of observed tensors of shape
         (seq_len, batch_size, npeople, data_dim)
-
         Predicted Normal loc and scale are of shape
         (nz_samples, seq_len, batch_size, npeople, data_dim)
-
         Returns a tuple of tensors corresponding to
         (observed, observed_start, offset, future_gt, future_mean, future_std)
-
         """
         # HACK: Take mean over nz_samples, assuming nz_samples=1
         future_means = outputs.stochastic.loc.mean(0)
@@ -96,12 +91,10 @@ class TestSequenceProcessor(Callback):
         )
         return seqs
 
-    def denormalize(
-            self, outputs: Seq2SeqPredictions, batch: DataSplit
-        ) -> Tuple[Seq2SeqSamples, Seq2SeqPredictions]:
-        """ Destandardize the stochastic predictions and inputs """
-        # TODO: Refactor types to dataclass instead of named tuple
-        # TODO: Write a method to detach
+    def detach_tensors(
+        self, outputs: Seq2SeqPredictions, batch: DataSplit
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """ Return the target observed and future, and predicted means and std """
         # Input samples consist of tensors of shape
         # (seq_len, nseq, npeople, data_dim)
         obs = batch.target.observed.contiguous().detach().cpu()
@@ -110,6 +103,13 @@ class TestSequenceProcessor(Callback):
         # (nz_samples, seq_len, nseq, npeople, data_dim)
         fut_means = outputs.stochastic.loc.contiguous().detach().cpu()
         fut_scales = outputs.stochastic.scale.contiguous().detach().cpu()
+        return obs, fut, fut_means, fut_scales
+
+    def denormalize(
+            self, outputs: Seq2SeqPredictions, batch: DataSplit
+    ) -> Tuple[Seq2SeqSamples, Seq2SeqPredictions]:
+        """ Destandardize the stochastic predictions and inputs """
+        obs, fut, fut_means, fut_scales = self.detach_tensors(outputs, batch)
 
         # Destandardize inputs and predictions before computing metric
         normed = [obs, fut, fut_means]
@@ -117,28 +117,13 @@ class TestSequenceProcessor(Callback):
         # Scale the std by the same scaling factor as the means
         fut_scales *= self.train_std
 
-        # Repack the data with the denormalized tensors
-        target = batch.target
-        target = Seq2SeqSamples(
-            key=target.key, observed_start=target.observed_start,
-            observed=denormed[0], future_len=target.future_len,
-            offset=target.offset, future=denormed[1]
-        )
-        predictions = Seq2SeqPredictions(
-            stochastic=Normal(denormed[2], fut_scales),
-            posteriors=outputs.posteriors,
-            deterministic=outputs.deterministic
-        )
-
-        return predictions, target
+        return *denormed, fut_scales
 
 
 class TestSerializer(TestSequenceProcessor):
 
     """ Serialize test outputs from the SocialProcess model.
-
     Results are pickled as well as writted to csv for visualization.
-
     """
 
     def __init__(
@@ -149,7 +134,6 @@ class TestSerializer(TestSequenceProcessor):
             group_map: Optional[SerializationMap] = None
         ) -> None:
         """ Initialize the serializer object
-
         Args:
             out_dir         --  directory to store outputs
             time_stride     --  the sampling rate of the sequences
@@ -158,7 +142,6 @@ class TestSerializer(TestSequenceProcessor):
             map             --  The SerializationMap specifying the group_ids
                                 and corresponding observed start ranges to
                                 serialize. Ignored if serialize_seq is False.
-
         """
         super().__init__(out_dir, train_mean, train_std)
         self.time_stride = time_stride
@@ -176,19 +159,30 @@ class TestSerializer(TestSequenceProcessor):
             dataloader_idx: int
         ) -> None:
         """ Serialize test outputs to self.out_dir
-
         Pickle the list of dictionaries. Write each sequence and future pair
         to a separate pickle file.
-
         """
         # Denormalize stochastic predictions and inputs
-        outputs, target = self.denormalize(outputs, batch)
+        # TODO: Refactor types to dataclass instead of named tuple
+        obs, fut, fut_means, fut_scales = self.denormalize(outputs, batch)
+        target = batch.target
+        target = Seq2SeqSamples(
+            key=target.key, observed_start=target.observed_start,
+            observed=obs, future_len=target.future_len,
+            offset=target.offset, future=fut
+        )
+        predictions = Seq2SeqPredictions(
+            stochastic=Normal(fut_means, fut_scales),
+            posteriors=outputs.posteriors,
+            deterministic=outputs.deterministic
+        )
+
 
         # Pickle the inputs and outputs
         if self.serialize_batch:
             filename = "all-outputs-{}_{}.pkl".format(dataloader_idx, batch_idx)
             with open(self.out_dir/filename, "wb") as fh:
-                pickle.dump({"inputs": target, "predictions": outputs}, fh)
+                pickle.dump({"inputs": target, "predictions": predictions}, fh)
 
         if self.serialize_seq:
             # Check if the batch is from a group to serialize
@@ -199,26 +193,25 @@ class TestSerializer(TestSequenceProcessor):
                 else:
                     bounds = self.group_map[batch.target.key]
             # Pickle each observed sequence and prediction to a separate file
-            enum_seqs = enumerate(self.split_test_sequences(outputs, target))
-            for idx, (obs, start, offset, fut, fut_mean, fut_std) in enum_seqs:
+            enum_seqs = enumerate(self.split_test_sequences(predictions, target))
+            for _, (obs, start, offset, fut, fut_mean, fut_std) in enum_seqs:
                 # Skip serializing if start is not in self.obs_start_bound
                 if (bounds != -1
                         and not any([start in range(b[0], b[1])
                                      for b in bounds])):
                     continue
                 # Create the file as
-                # "<dataloader_idx>_<batch_idx>_<seq_idx>-group_id=<group_id>"
-                # "-start=<start>-offset=<offset>.pkl"
+                # "group_id=<group_id>-start=<start>-offset=<offset>.pkl"
                 filename = "group_id={}-start={}-offset={}.pkl".format(
-                    batch.target.key, int(start), int(offset)
+                    target.key, int(start), int(offset)
                 )
                 payload = {
-                    "observed": obs.squeeze(1).detach().cpu().numpy(),
+                    "observed": obs.squeeze(1).numpy(),
                     "observed_start": int(start),
                     "offset": int(offset),
-                    "future": fut.squeeze(1).detach().cpu().numpy(),
-                    "fut_mean": fut_mean.squeeze(1).detach().cpu().numpy(),
-                    "fut_scale": fut_std.squeeze(1).detach().cpu().numpy(),
+                    "future": fut.squeeze(1).numpy(),
+                    "fut_mean": fut_mean.squeeze(1).numpy(),
+                    "fut_scale": fut_std.squeeze(1).numpy(),
                     "time_stride": self.time_stride
                 }
                 with open(self.out_dir / filename, "wb") as fh:
@@ -228,22 +221,21 @@ class TestSerializer(TestSequenceProcessor):
 class MetricsComputer(TestSequenceProcessor):
 
     """ Compute evaluation metrics.
-
     Each sequence has a series of summary metrics and timestep metrics.
     These include nll, body and head location and rotation errors, and
     speaking status accuracy. The dataframe of metrics is stored in the
     specified output directory with the name `test_metrics.h5`.
-
     """
 
     def __init__(self, out_dir: Path, nposes: int, ntimesteps: int,
                  time_stride: int, train_mean: Tensor, train_std: Tensor,
-                 project_rotation: bool = True) -> None:
+                 feature_set: FeatureSet = FeatureSet.HBPS, project_rotation: bool = True) -> None:
         """ Initialize the callback object """
         super().__init__(out_dir, train_mean, train_std)
         self.nposes = nposes
         self.nsteps = ntimesteps
         self.stride = time_stride
+        self.feature_set = feature_set
         self.project_rotation = project_rotation
         self.batch_metrics = []
 
@@ -255,10 +247,8 @@ class MetricsComputer(TestSequenceProcessor):
     @staticmethod
     def _root_metric_names(nposes: int, project_rot: bool = True) -> List[str]:
         """ Prefix and suffix free names of metrics to use as columns
-
         Internal method; "mean_" or "_ts" is added to these by other static
         methods in this class. Returned list does not contain speaking metrics.
-
         """
         poses = ["body", "head"] if nposes == 2 else ["head"]
         means_metrics = ["loc_err", "rot_err"]
@@ -270,31 +260,27 @@ class MetricsComputer(TestSequenceProcessor):
         return metrics
 
     @staticmethod
-    def summary_columns(nposes: int,  project_rot: bool = True) -> List[str]:
+    def summary_columns(feature_set: FeatureSet, nposes: int,  project_rot: bool = True) -> List[str]:
         """ Column names for the seq summary metrics in the output dataframe """
-        return [
-            *["mean_"+m for m in MetricsComputer._root_metric_names(
-                nposes, project_rot)],
-            "speaking_accuracy"
-        ]
+        cols =  ["mean_"+m for m in MetricsComputer._root_metric_names(nposes, project_rot)]
+        if feature_set == FeatureSet.HBPS:
+            cols.append("speaking_accuracy")
+        return cols
 
     @staticmethod
-    def ts_columns(nposes: int,  project_rot: bool = True) -> List[str]:
+    def ts_columns(feature_set: FeatureSet, nposes: int,  project_rot: bool = True) -> List[str]:
         """ Column names for the timestep metrics in the output dataframe """
-        return [
-            *[m+"_ts" for m in MetricsComputer._root_metric_names(
-                nposes, project_rot)],
-            "speaking_accuracy_ts"
-        ]
+        cols = [m+"_ts" for m in MetricsComputer._root_metric_names(nposes, project_rot)]
+        if feature_set == FeatureSet.HBPS:
+            cols.append("speaking_accuracy_ts")
+        return cols
 
     def df_columns(self) -> pd.MultiIndex:
         """ Computes the multi-index for the metrics dataframe """
         # Create top level columns for summary and ts metrics
         info_cols = MetricsComputer.info_columns()
-        summary_cols = MetricsComputer.summary_columns(
-            self.nposes, self.project_rotation
-        )
-        ts_cols = MetricsComputer.ts_columns(self.nposes, self.project_rotation)
+        summary_cols = MetricsComputer.summary_columns(self.feature_set, self.nposes, self.project_rotation)
+        ts_cols = MetricsComputer.ts_columns(self.feature_set, self.nposes, self.project_rotation)
         ts_cols_repeated = list(itertools.chain.from_iterable(
             itertools.repeat(m, self.nsteps) for m in ts_cols
         ))
@@ -310,21 +296,19 @@ class MetricsComputer(TestSequenceProcessor):
             self, future_means: Tensor, future_scales: Tensor, future: Tensor
         ) -> np.ndarray:
         """ Compute nll per timestep
-
+        Inputs of shape (seq_len, nsequences, npeople, data_dim)
         Returns mean nll per timestep:
-            mean_nll            --  (batch_size, seq_len)
-
+            mean_nll            -- np.ndarray (nsequences, seq_len)
         """
         nll = - Normal(future_means, future_scales).log_prob(future)
-        return nll.sum(dim=(2, 3)).numpy()
+        nll = nll.sum(dim=(2, 3))
+        return nll.transpose(0, 1).contiguous().numpy()
 
     def location_errors_timestep(
             self, future_means: Tensor, future: Tensor
         ) -> List[np.ndarray]:
         """ Compute mean mse in location per timestep and sequence
-
         Returns a list of the mse per timestep for each pose (body, head, etc)
-
         """
         loc_idx = multi_range(3, self.nposes, 7, start=4)
         dist = []
@@ -347,11 +331,9 @@ class MetricsComputer(TestSequenceProcessor):
             self, future_means: Tensor, future: Tensor
         ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """ Compute error in orientation per timestep and sequence
-
         Returns two lists for the absolute, and reprojected, error in degrees
         per timestep for every pose. The second list is empty if
         self.project_rotation is False
-
         """
         nseqs, seq_len, npeople, _ = future_means.size()
         rot_idx = multi_range(4, self.nposes, 7)
@@ -409,33 +391,32 @@ class MetricsComputer(TestSequenceProcessor):
             outputs: Seq2SeqPredictions, batch: DataSplit, batch_idx: int,
             dataloader_idx: int
         ) -> None:
-        """ Compute test metrics for each seq and save to self.out_dir
-
-        Metrics are stored in a pandas DataFrame.
-
+        """ Compute test metrics for each sequence in the batch
+        Metrics are stored in a pandas DataFrame in self.out_dir at the end of
+        the test epoch.
         """
-        # Denormalize stochastic predictions and inputs
-        predictions, target = self.denormalize(outputs, batch)
-        # HACK: Take mean over nz_samples and transpose to get
-        # (nseq, seq_len, npeople, data_dim) (assumes 1 nz_samples)
-        fut_means = predictions.stochastic.loc.mean(0)
-        fut_scales = predictions.stochastic.scale.mean(0)
-
-        # Samples consist of tensors of shape
-        # (seq_len, nseq, npeople, data_dim)
-        # Convert to (nseq, seq_len, ...)
-        def transpose_and_detach(t: Tensor) -> Tensor:
-            return t.transpose(0, 1).contiguous()
-
-        fut = transpose_and_detach(target.future)
-        fut_means = transpose_and_detach(fut_means)
-        fut_scales = transpose_and_detach(fut_scales)
-
-        ## Compute the metrics
-        # 1. Negative Log Likelihood - mean, per timestep
-        nll_ts = self.nll_timestep(fut_means, fut_scales, fut) # (nseq, seq_len)
+        # 1. Compute Negative Log Likelihood - mean, per timestep on non denormalized data
+        nll_ts = self.nll_timestep(
+            outputs.stochastic.loc.mean(0).detach().cpu(),
+            outputs.stochastic.scale.mean(0).detach().cpu(),
+            batch.target.future
+        ) # (nseq, seq_len)
         mean_nll = nll_ts.mean(1, keepdims=True) # (nseq, 1)
 
+        # Denormalize stochastic predictions and inputs
+        _, fut, fut_means, fut_scales = self.denormalize(outputs, batch)
+
+        # HACK: Take mean over nz_samples and transpose to get
+        # (nseq, seq_len, npeople, data_dim) (assumes 1 nz_samples)
+        fut_means = fut_means.mean(0)
+        fut_scales = fut_scales.mean(0)
+
+        # Samples consist of tensors of shape (seq_len, nseq, npeople, data_dim)
+        # Convert to (nseq, seq_len, ...)
+        fut, fut_means, fut_scales = [t.transpose(0, 1).contiguous()
+                                      for t in [fut, fut_means, fut_scales]]
+
+        # Compute the rest of the metrics
         # 2. MSE for body loc and head loc - mean, per timestep
         dist_ts = self.location_errors_timestep(fut_means, fut) # (nseq, seq_len)
         mean_dist = [err.mean(1, keepdims=True) for err in dist_ts] # (nseq, 1)
@@ -444,10 +425,6 @@ class MetricsComputer(TestSequenceProcessor):
         rot_err_ts, proj_rot_err_ts = \
             self.rotation_errors_timestep(fut_means, fut) # (nseq, seq_len)
         mean_rot_err = [err.mean(1, keepdims=True) for err in rot_err_ts] # (nseq)
-
-        # 4. Speaking status error
-        # (nseq, 1), (nseq, seq_len)
-        speaking_acc, speaking_acc_ts = self.speaking_errors(fut_means, fut)
 
         # Store in lists to stack
         mean_metrics = [mean_nll, *mean_dist, *mean_rot_err]
@@ -459,9 +436,13 @@ class MetricsComputer(TestSequenceProcessor):
             mean_metrics.extend(mean_proj_rot_err)
             ts_metrics.extend(proj_rot_err_ts)
 
-        # Add speaking status at the end
-        mean_metrics.append(speaking_acc)
-        ts_metrics.append(speaking_acc_ts)
+        # 4. Speaking status error
+        # (nseq, 1), (nseq, seq_len)
+        if self.feature_set == FeatureSet.HBPS:
+            speaking_acc, speaking_acc_ts = self.speaking_errors(fut_means, fut)
+            # Add speaking status at the end
+            mean_metrics.append(speaking_acc)
+            ts_metrics.append(speaking_acc_ts)
 
         # Include group_id, obs_start, offset
         g_id = np.array([batch.target.key]*fut.size(0))[:, np.newaxis]
@@ -477,6 +458,15 @@ class MetricsComputer(TestSequenceProcessor):
 
     def on_test_epoch_end(self, trainer: Trainer, pl_module: LightningModule):
         """ Stack individual batch metrics, create dataframe, and serialize """
+        # Create and save the metrics df
         metrics = np.vstack(self.batch_metrics)
         df = pd.DataFrame(data=metrics, columns=self.df_columns())
         df.to_hdf(self.out_dir/"test_metrics.h5", key="test_metrics")
+        # Compute statistics over the summary columns and write to csv
+        summary_cols = MetricsComputer.summary_columns(self.feature_set, self.nposes, self.project_rotation)
+        summary_metrics = df[summary_cols]
+        summary_metrics = summary_metrics.apply(pd.to_numeric)
+        stats = summary_metrics.describe()
+        stats[~stats.index.isin(["25%", "50%", "75%"])].to_csv(
+            self.out_dir/"summary_metrics.csv", index_label="statistic"
+        )

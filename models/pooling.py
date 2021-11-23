@@ -16,6 +16,7 @@ from torch import Tensor
 
 from common.architecture.mlp import MLP
 from common.tensor_op import multi_range
+from data.types import FeatureSet
 
 
 def invert_quat(q: Tensor) -> Tensor:
@@ -55,6 +56,94 @@ def compose_quat(q1: Tensor, q2: Tensor) -> Tensor:
     return product
 
 
+def compute_partners(features: Tensor) -> Tensor:
+    """ For each person computes the features of the partners.
+
+    For a (ngroups x npeople x features) dim input, creates a new dimension
+    to contain the features of the partners, resulting in a
+    (ngroups x npeople x npeople-1 x features) tensor.
+
+    Args:
+        features    --  features tensor for people in the scene.
+                        (batch_size(i.e. ngroups), npeople, features)
+
+    Returns:
+        Tensor containing features of partners for each person
+        (batch_size, npeople, npeople-1, features)
+
+    """
+    return torch.stack(
+        [torch.cat([features[:, :idx], features[:, idx+1:]], dim=1)
+            for idx in range(features.shape[1])]
+    ).transpose(0, 1).contiguous()
+
+
+def relative_rotation(partners: Tensor, reference: Tensor) -> Tensor:
+    """ Compute relative orientation of conversation partners
+
+    Refer `relative_features` for details on how the relative
+    rotation is calculated.
+
+    Args:
+        partners    --  The orientations of partners as Euler angles around
+                        world coordinate axes
+                        (batch_size, npeople, npeople-1, 4) where
+                        npeople denotes the number of people in the group
+        reference   --  The orientations of the reference persons as Euler
+                        angles around world coordinate axes, repeated to
+                        match the shape of the partners tensor
+                        (batch_size, npeople, npeople-1, 4)
+
+    Returns:
+        The tensor of Quaternion rotations in scalar first (w, x, y, z)
+        format, which when applied the partner orientation results in the
+        reference orientation.
+
+    """
+    return compose_quat(reference, invert_quat(partners))
+
+
+def relative_hbp(partners: Tensor, reference: Tensor) -> Tensor:
+    """ Compute relative head and body orientation and position
+
+    Args:
+        partners    --  The features of partners in a group
+                        (batch_size, npeople, npeople-1, 14) where
+                        npeople denotes the number of people in the group
+        reference   --  The features of the reference persons
+                        (batch_size, npeople, npeople-1, 14)
+
+    """
+    nposes = 2
+    # Get the indices for rotation and location features
+    rot_idx = multi_range(4, nposes, 7)
+    loc_idx = multi_range(3, nposes, 7, start=4)
+    # Compute the relative features of partners wrt reference persons
+    relative_rot = relative_rotation(
+        partners[..., rot_idx].view(-1, 4),
+        reference[..., rot_idx].view(-1, 4)
+    ).view(*partners.shape[:-1], nposes*4)
+    relative_pos = partners[..., loc_idx] - reference[..., loc_idx]
+    return torch.cat((relative_rot, relative_pos), dim=-1)
+
+
+def relative_hbps(partners: Tensor, reference: Tensor) -> Tensor:
+    """ Compute relative head and body orientation and position, and
+    speaking status
+
+    Args:
+        partners    --  The features of partners in a group
+                        (batch_size, npeople, npeople-1, 14) where
+                        npeople denotes the number of people in the group
+        reference   --  The features of the reference persons
+                        (batch_size, npeople, npeople-1, 14)
+
+    """
+    rel_hbp = relative_hbp(partners, reference)
+    rel_ss = partners[..., -1:] - reference[..., -1:]
+    return torch.cat((rel_hbp, rel_ss), dim=-1)
+
+
 class SocialPooler(nn.Module):
 
     """ Encode social context from each individual's perspective.
@@ -81,8 +170,14 @@ class SocialPooler(nn.Module):
 
     """
 
+    relative_features_func_map = {
+        FeatureSet.HBP: relative_hbp,
+        FeatureSet.HBPS: relative_hbps
+    }
+
     def __init__(self, ninp: int, nhid_embed: int, nhid_pool: int, nrep: int,
-                 nout: int, nposes: int = 1, dropout: float = 0) -> None:
+                 nout: int, nposes: int = 1, dropout: float = 0,
+                 feature_set: FeatureSet = FeatureSet.HBPS) -> None:
         """ Initialize the pooling module. """
         super().__init__()
         self.embedder = MLP(ninp, nhid_embed, nhid_embed, nlayers=2,
@@ -90,53 +185,7 @@ class SocialPooler(nn.Module):
         self.pre_pooler = MLP(nhid_embed+nrep, nout, nhid_pool, nlayers=2,
                               dropout=dropout, act_kwargs={"inplace":"True"})
         self.nout = nout
-        self.nposes = nposes
-
-    @staticmethod
-    def compute_partners(features: Tensor) -> Tensor:
-        """ For each person computes the features of the partners.
-
-        For a (ngroups x npeople x features) dim input, creates a new dimension
-        to contain the features of the partners, resulting in a
-        (ngroups x npeople x npeople-1 x features) tensor.
-
-        Args:
-            features    --  features tensor for people in the scene.
-                            (batch_size(i.e. ngroups), npeople, features)
-
-        Returns:
-            Tensor containing features of partners for each person
-            (batch_size, npeople, npeople-1, features)
-
-        """
-        return torch.stack(
-            [torch.cat([features[:, :idx], features[:, idx+1:]], dim=1)
-             for idx in range(features.shape[1])]
-        ).transpose(0, 1).contiguous()
-
-    def relative_rotation(self, partners: Tensor, reference: Tensor) -> Tensor:
-        """ Compute relative orientation of conversation partners
-
-        Refer `relative_features` for details on how the relative
-        rotation is calculated.
-
-        Args:
-            partners    --  The orientations of partners as Euler angles around
-                            world coordinate axes
-                            (batch_size, npeople, npeople-1, 4) where
-                            npeople denotes the number of people in the group
-            reference   --  The orientations of the reference persons as Euler
-                            angles around world coordinate axes, repeated to
-                            match the shape of the partners tensor
-                            (batch_size, npeople, npeople-1, 4)
-
-        Returns:
-            The tensor of Quaternion rotations in scalar first (w, x, y, z)
-            format, which when applied the partner orientation results in the
-            reference orientation.
-
-        """
-        return compose_quat(reference, invert_quat(partners))
+        self.relative_features_computer = self.relative_features_func_map[feature_set]
 
     def relative_features(self, features: Tensor) -> Tensor:
         """ Compute the realtive pose, position, and speaking status
@@ -163,20 +212,10 @@ class SocialPooler(nn.Module):
 
         """
         # Compute the tensor of partner features for every reference person
-        partners = SocialPooler.compute_partners(features)
+        partners = compute_partners(features)
         # Expand reference features to match partners tensor size
-        references = features.unsqueeze(2).repeat(1, 1, features.shape[1]-1, 1)
-        # Get the indices for rotation and location features
-        rot_idx = multi_range(4, self.nposes, 7)
-        loc_idx = multi_range(3, self.nposes, 7, start=4)
-        # Compute the relative features of partners wrt reference persons
-        relative_rot = self.relative_rotation(
-            partners[..., rot_idx].view(-1, 4),
-            references[..., rot_idx].view(-1, 4)
-        ).view(*partners.shape[:-1], self.nposes*4)
-        relative_pos = partners[..., loc_idx] - references[..., loc_idx]
-        relative_ss = partners[..., -1:] - references[..., -1:]
-        return torch.cat((relative_rot, relative_pos, relative_ss), dim=-1)
+        reference = features.unsqueeze(2).repeat(1, 1, features.shape[1]-1, 1)
+        return self.relative_features_computer(partners, reference)
 
     def forward(self, features: Tensor, embeddings: Tensor) -> Tensor:
         """ Compute the forward pass through the pooling module
@@ -197,14 +236,14 @@ class SocialPooler(nn.Module):
         # Compute the relative head poses, positions, and speaking status of
         # partners with respect to a reference person, for every person
         # shape (batch_size, npeople, npeople-1, feature_dim)
-        relative_features = self.relative_features(features)
+        rel_features = self.relative_features(features)
         # Embed the relative features
         # shape (batch_size, npeople, npeople-1, self.nhid)
-        relative_embeddings = self.embedder(relative_features)
+        relative_embeddings = self.embedder(rel_features)
         # Rearrange the absolute feature embeddings to match the shape of
         # the tensor comprising features for each person
         # shape (batch_size, npeople, npeople-1, self.nrep)
-        abs_embeddings = SocialPooler.compute_partners(embeddings)
+        abs_embeddings = compute_partners(embeddings)
         # Concatenate the relative embeddings with corresponding absolute
         # feature embeddings for the partners
         # shape (batch_size, npeople, npeople-1, self.nhid+self.nrep)

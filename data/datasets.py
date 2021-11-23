@@ -15,17 +15,16 @@ from argparse import ArgumentParser, Namespace
 from collections import OrderedDict
 from functools import cached_property
 from itertools import chain
-from pathlib import Path
-from typing import Any, OrderedDict, List, Tuple, NamedTuple, Sequence
+from typing import Any, Callable, List, NamedTuple, OrderedDict, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from torch.utils import data
 
-from .types import Seq2SeqSamples
+from .types import Seq2SeqSamples, BucketType
 
 
-class SyntheticGlancing(data.Dataset):
+class ToySine(data.Dataset):
 
     """ Toy dataset with frequency swept sine waves. """
 
@@ -69,7 +68,6 @@ class GroupSequence(NamedTuple):
     features: Any
 
 
-
 class SequencePair(NamedTuple):
 
     """ Local structure to encapsulate a sequence pair """
@@ -82,28 +80,24 @@ class SequencePair(NamedTuple):
     offset: int
 
 
-# Type alias for a bucket map. See `compute_buckets` for details
-BucketMap = OrderedDict[Tuple[int, int, int], OrderedDict[int, List]]
+# Type aliases for bucket maps. See `compute_group_buckets` and `compute_sequence_buckets` for details
+GroupBucketMap = OrderedDict[Tuple[int, int, int], OrderedDict[int, List]]
+SeqBucketMap = OrderedDict[Tuple[int, int], OrderedDict[int, List]]
+BucketMap = Union[GroupBucketMap, SeqBucketMap]
 
 
-class SocialDatasetInterface(data.Dataset, metaclass=abc.ABCMeta):
-    """ Abstract interface for a SocialDataset """
-    @property
-    @abc.abstractmethod
-    def bucket_map(self) -> BucketMap:
-        """ Return a BucketMap for aiding generation of batches """
-        raise NotImplementedError
+def _compute_buckets(pairs: Sequence[SequencePair], key_extractor: Callable) -> BucketMap:
+    """ Helper function to compute bucket maps
 
+    Args:
+        pairs           --  The list of SequencePair objects to bucket
+        key_extractor   --  A function that returns a key given a SequencePair
 
-def compute_buckets(pairs: List[SequencePair]) -> BucketMap:
-    """ Compute the bucket map for the sequences
-
-    Map a tuple of (group_id, obs_len, fut_len) to a map of observed index to
-    list of indices
+    Returns a BucketMap object (doesn't do any explicit type checking)
     """
     bucket_map = OrderedDict()
     for idx, pair in enumerate(pairs):
-        key = (pair.key[0], pair.obs_len, pair.fut_len)
+        key = key_extractor(pair)
         if key not in bucket_map:
             # Create a new dictionary for the key and add
             obs_map = OrderedDict()
@@ -119,9 +113,48 @@ def compute_buckets(pairs: List[SequencePair]) -> BucketMap:
     return bucket_map
 
 
+def compute_group_buckets(pairs: List[SequencePair]) -> GroupBucketMap:
+    """ Compute the bucket map for the sequences
+
+    Map a tuple of (group_id, obs_len, fut_len) to a map of observed index to
+    list of indices
+    """
+    key_extractor = lambda pair: (pair.key[0], pair.obs_len, pair.fut_len)
+    return _compute_buckets(pairs, key_extractor)
+
+
+def compute_seq_buckets(pairs: List[SequencePair]) -> SeqBucketMap:
+    """ Compute the bucket map for the sequences
+
+    Map a tuple of (obs_len, fut_len) to a map of observed index to
+    list of indices
+    """
+    key_extractor = lambda pair: (pair.obs_len, pair.fut_len)
+    return _compute_buckets(pairs, key_extractor)
+
+
+class SocialDatasetInterface(data.Dataset, metaclass=abc.ABCMeta):
+    """ Abstract interface for a SocialDataset """
+    @property
+    @abc.abstractmethod
+    def group_bucket_map(self) -> GroupBucketMap:
+        """ Return a GroupBucketMap for aiding generation of batches """
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def seq_bucket_map(self) -> SeqBucketMap:
+        """ Return a SeqBucketMap for aiding generation of batches """
+        raise NotImplementedError
+
+
+# Map for accessing bucket attribute name by type
+BUCKET_ATTR_NAME = {BucketType.GROUP: "group_bucket_map", BucketType.SEQ: "seq_bucket_map"}
+
+
 class SocialDataset(SocialDatasetInterface):
 
-    """ Encapsulate the dataset of social interactions """
+    """ Encapsulate the synthetic social dataset created in Blender3D """
 
     @staticmethod
     def group_fields() -> List:
@@ -149,6 +182,8 @@ class SocialDataset(SocialDatasetInterface):
         self.hparams = hparams
         self.obs_df = obs_df
         self.fut_df = obs_df if fut_df is None else fut_df
+        assert (not self.obs_df.isnull().values.any()) and (not self.fut_df.isnull().values.any()), \
+            "SocialDataset init; Either the observed or future dataframe has NAN values!"
         self.feature_fields = feature_fields
         # Compute the keys and make sure they are the same for observed
         # and future dfs
@@ -221,7 +256,7 @@ class SocialDataset(SocialDatasetInterface):
             self, key: Tuple[int, int], df: pd.DataFrame,
             seq_len: int, overlap: float
         ) -> List[GroupSequence]:
-        """ Compute samples for a unique group """
+        """ Compute samples for a unique group (assumes contiguous chunk of data) """
         # key is a tuple of (group_id, group_size)
         _, gsize = key
         nrows = np.arange(len(df))
@@ -234,12 +269,13 @@ class SocialDataset(SocialDatasetInterface):
         # A sequence comprises of start_frame, end_frame, and data
         seqs = []
         for s in map(s_data, bounds):
-            values = s[self.feature_fields].values.astype(np.float32)
-            values = values.reshape(-1, gsize, values.shape[-1])
-            gseq = GroupSequence(
-                s["frame"].iloc[0], s["frame"].iloc[-1], values
-            )
-            seqs.append(gseq)
+            if len(s) >= nseq_rows: # Check there are sufficient rows
+                values = s[self.feature_fields].values.astype(np.float32)
+                values = values.reshape(-1, gsize, values.shape[-1])
+                gseq = GroupSequence(
+                    s["frame"].iloc[0], s["frame"].iloc[-1], values
+                )
+                seqs.append(gseq)
         return seqs
 
     def _compute_samples_for_df(
@@ -253,8 +289,13 @@ class SocialDataset(SocialDatasetInterface):
         seq_dict = OrderedDict()
         for g in dfs.groupby(SocialDataset.group_fields()):
             key, group_df = g
-            seqs = self._sequences_for_group(key, group_df, seq_len, overlap)
-            seq_dict[key] = seqs
+            seqs_for_group = []
+            # Process contiguous chunks
+            predicate = (group_df.frame - group_df.frame.shift() > stride)
+            for _, chunk in group_df.groupby(predicate.cumsum()):
+                seqs = self._sequences_for_group(key, chunk, seq_len, overlap)
+                seqs_for_group.extend(seqs)
+            seq_dict[key] = seqs_for_group
         return seq_dict
 
     def compute_samples(self, fix_future_len=False) -> None:
@@ -271,13 +312,20 @@ class SocialDataset(SocialDatasetInterface):
         self.pairs = list(chain(*group_pairs.values()))
 
     @cached_property
-    def bucket_map(self) -> BucketMap:
-        """ Override SocialDatasetInterface.bucket_map()
+    def group_bucket_map(self) -> GroupBucketMap:
+        """ Override SocialDatasetInterface.group_bucket_map()
 
-        Map a tuple of (group_id, obs_len, fut_len) to a map of observed idx
-        to sample indices
+        Map a tuple of (group_id, obs_len, fut_len) to a map of observed idx to sample indices
         """
-        return compute_buckets(self.pairs)
+        return compute_group_buckets(self.pairs)
+
+    @cached_property
+    def seq_bucket_map(self) -> SeqBucketMap:
+        """ Override SocialDatasetInterface.seq_bucket_map()
+
+        Map a tuple of (obs_len, fut_len) to a map of observed idx to sample indices
+        """
+        return compute_seq_buckets(self.pairs)
 
     def _convert_pair(self, pair: SequencePair, seqs: OrderedDict) -> Seq2SeqSamples:
         """ Convert a SequencePair to Seq2SeqSamples """
@@ -311,20 +359,21 @@ class SocialDataset(SocialDatasetInterface):
         """ Add args pertaining to the model and training of the process """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument("--observed_len", type=int, default=10,
-                            help="number of observed timesteps")
+                            help="number of observed timesteps (# rows from the dataframe)")
         parser.add_argument("--future_len", type=int, default=10,
-                            help="number of future timesteps to predict")
+                            help="number of future timesteps to predict (# rows from the dataframe)")
         parser.add_argument("--time_stride", type=int, default=1,
-                            help="sampling rate of frames in the dataset; "
-                            "for eg. a stride of 3 means every third frame "
-                            "is taken")
+                            help="sampling rate of rows in the dataset, expressed as multiple of frame difference "
+                                 "between rows; for eg."
+                                 "for a dataset where each row is 20 frames apart, a stride of 60 means every third "
+                                 "row will be taken.")
         parser.add_argument("--overlap", type=float, default=0.8,
                             help="Overlap between observed sequences [0, 1)")
         parser.add_argument("--all_futures", default=False, action="store_true",
                             help="Take all future sequences within max offset "
                                  "instead of applying overlap")
         parser.add_argument("--max_future_offset", type=int, default=150,
-                            help="maximum offset between the end of the observed "
+                            help="maximum offset in frame values between the end of the observed "
                             "and beginning of the future sequence, inclusive")
 
         return parser

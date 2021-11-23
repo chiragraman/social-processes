@@ -36,7 +36,7 @@ def init_social_pooling(hparams: Namespace) -> TemporalPooler:
         social_pooler = SocialPooler(
             hparams.data_dim, hparams.pooler_nhid_embed, hparams.pooler_nhid_pool,
             hparams.r_dim, hparams.pooler_nout, hparams.nposes,
-            dropout=hparams.dropout
+            dropout=hparams.dropout, feature_set=hparams.feature_set
         )
         pooler_enc = None
         if hparams.pooler_stride != -1:
@@ -121,9 +121,9 @@ class RecurrentBuilder:
         # Initialize sequence encoders and decoders
         enc, dec, lat_enc, lat_dec, det_enc, det_dec = cls.init_rnn(
             hparams.data_dim, hparams.enc_nhid, hparams.r_dim, hparams.dec_nhid,
-            hparams.z_dim, hparams.nlayers, hparams.fix_variance,
-            hparams.share_target_encoder, hparams.use_deterministic_path,
-            hparams.skip_deterministic_decoding, hparams.dropout
+            hparams.nlayers, hparams.fix_variance, hparams.share_target_encoder,
+            hparams.use_deterministic_path, hparams.skip_deterministic_decoding,
+            hparams.dropout
         )
 
         # Initialize the pooler if needed
@@ -155,7 +155,7 @@ class RecurrentBuilder:
     @staticmethod
     def init_rnn(
             data_dim: int, encoder_nhid: int, encoder_nout: int,
-            decoder_nhid: int, z_dim: int, nlayers: int, fix_variance: bool,
+            decoder_nhid: int, nlayers: int, fix_variance: bool,
             share_trg_encoder: bool = True, deterministic_path: bool = False,
             skip_det_decoding: bool = False, dropout: float = 0
         ) -> Tuple[EncoderRNN, DecoderRNN, EncoderRNN, DecoderRNN, EncoderRNN,

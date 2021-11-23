@@ -14,3 +14,7 @@ CHECKPOINTS_SUBDIR = "checkpoints"
 
 PANOPTIC_BODY_DIR = "panopticDB_body_pkl_hagglingProcessed"
 PANOPTIC_SPEECH_DIR = "panopticDB_speech_pkl_hagglingProcessed"
+
+MNM_PARTICIPANTS = "PARTICIPANTS.csv"
+MNM_LABELS = "LABELS.csv"
+MNM_LOST = "LOST.csv"

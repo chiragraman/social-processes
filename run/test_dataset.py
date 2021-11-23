@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 ###
-# File: test_.py
+# File: test_dataset.py
 # Created Date: Tuesday, January 5th 2021, 1:00:07 pm
 # Author: Chirag Raman
 #
@@ -11,27 +11,22 @@
 
 import argparse
 import logging
-import pickle
-from argparse import Namespace
 from enum import Enum, auto
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-from pytorch_lightning import LightningModule, Trainer, seed_everything
-from pytorch_lightning.loggers import TestTubeLogger
+from pytorch_lightning import Trainer, seed_everything
 
 from common.initialization import init_torch
 from common.utils import EnumAction, configure_logging
 from common.model import summarize
 from data.datasets import SocialDataset
-from data.types import (
-    ModelType, ComponentType, ContextRegime, SerializationMap
-)
+from data.types import ContextRegime, SerializationMap, FeatureSet
 from lightning.callbacks import MetricsComputer, TestSerializer
 from lightning.data import SPSocialDataModule, COLUMNS_TO_STDIZE
-from run.utils import average_ckpts, init_model, init_data
+from run.utils import add_commmon_args, average_ckpts, init_model, init_data
 
 
 class ModelLoadProc(Enum):
@@ -42,7 +37,7 @@ class ModelLoadProc(Enum):
     AVG_CKPTS  = auto()
 
 
-def parse_serializiation_map(arg: str) -> SerializationMap:
+def parse_serialization_map(arg: str) -> SerializationMap:
     """ Convert string to map of group_id to list of tuples of obs starts
 
     Value for a group_id can be -1 for serializing all sequences or a sequence
@@ -76,24 +71,17 @@ def parse_serializiation_map(arg: str) -> SerializationMap:
 def main():
     """ Run the main experiment """
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("-s", "--seed", type=int, default=1234,
-                        help="seed for initializing pytorch")
     parser.add_argument("--load_proc", type=ModelLoadProc,
                         action=EnumAction, default=ModelLoadProc.CKPT,
                         help="procedure for loading model; ckpt, averaging ckpts, "
                               "or loading state dict. Default CKPT")
-    parser.add_argument("--ckpt_path", type=str,
-                        help="path to the model checkpoint; used if `load_proc` "
-                             "is CKPT.")
+    parser.add_argument("--ckpt_relpath", type=str,
+                        help="path to the model checkpoint relative to the "
+                             "artefacts/exp directory; used if `load_proc` is "
+                             "CKPT.")
     parser.add_argument("--ckpt_dir", type=str,
                         help="directory that contains checkpoints to average;"
                              "only used if `load_proc` is AVG_CKPTS")
-    parser.add_argument("--model", type=ModelType,
-                        action=EnumAction, default=ModelType.SOCIAL_PROCESS,
-                        help="type of model to train, default-social process")
-    parser.add_argument("--component", type=ComponentType,
-                        action=EnumAction, default=ComponentType.RNN,
-                        help="type of component modules, default-rnn")
     parser.add_argument("--results_dir", type=str, default="test_results",
                         help="root output dir name")
     parser.add_argument("--serialize_batch", default=False, action="store_true",
@@ -102,7 +90,7 @@ def main():
                         action="store_true",
                         help="skip serialization of individual sequences")
     parser.add_argument("--serialization_map", default=None,
-                        type=parse_serializiation_map,
+                        type=parse_serialization_map,
                         help="map from group_id to list of tuples denoting "
                              "start frames of observed sequences to serialize")
     parser.add_argument("--project_rot", default=False, action="store_true",
@@ -112,12 +100,8 @@ def main():
                         help="serialize the sequences serialization callback")
     parser.add_argument("--skip_metrics_cb", default=False, action="store_true",
                         help="serialize the metrics computation callback")
-    parser.add_argument("--log_level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                        help="Set the logging level, default: %(default)s)")
-    parser.add_argument("--log_file", type=str, default="test_logs.txt",
-                        help="filename for the log file for metrics")
 
+    parser = add_commmon_args(parser)
     parser = Trainer.add_argparse_args(parser)
     parser = SPSocialDataModule.add_data_args(parser)
     parser = SocialDataset.add_dataset_specific_args(parser)
@@ -131,11 +115,11 @@ def main():
     artefacts_dir = (Path(__file__).resolve().parent.parent / "artefacts/")
 
     if args.load_proc == ModelLoadProc.CKPT:
-        ckpt_path = Path(args.ckpt_path)
+        ckpt_path = artefacts_dir / "exp" / args.ckpt_relpath
         outroot = ckpt_path.parents[2]
     elif args.load_proc == ModelLoadProc.AVG_CKPTS:
-        ckpt_dir = Path(args.ckpt_dir)
-        outroot = ckpt_dir.parents[2]
+        ckpt_dir = artefacts_dir / "exp" / args.ckpt_dir
+        outroot = Path(ckpt_dir).parents[2]
 
     out_dir = outroot / args.results_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,12 +134,12 @@ def main():
         process = init_model(args, ckpt_path)
     elif args.load_proc == ModelLoadProc.AVG_CKPTS:
         logging.info("[*] Averaging checkpoints")
-        ckpts = list(ckpt_dir.glob("**/*"))
+        ckpts = list(Path(ckpt_dir).glob("**/*"))
         if len(ckpts) == 0:
             raise ValueError("Expecting checkpoints to average, found none")
         process = average_ckpts(ckpts, args)
         torch.save(process.state_dict(),
-                   ckpt_dir.parents[0] / "averaged.pt")
+                   Path(ckpt_dir).parents[0] / "averaged.pt")
     else:
         raise ValueError("Unsupported model loading procedure.")
 
@@ -164,31 +148,35 @@ def main():
     summarize(process)
 
     # Prepare the data module
+    dataset_dir = artefacts_dir / "datasets" / args.dataset_root
     if args.context_regime == ContextRegime.RANDOM:
         batches_fname = "test_batches_random_ctx.pkl"
     else:
         batches_fname = "test_batches_fixed_ctx.pkl"
-    dm = init_data(args, load_test_batches=True,
+    dm = init_data(args, dataset_dir, load_test_batches=True,
                    test_batches_fname=batches_fname)
     dm.setup("test")
 
     # Initialize the callbacks:
     # Load train statistics to denormalize
-    train_stats = pd.read_hdf(
-        artefacts_dir/"datasets/panoptic-haggling/train_description.h5"
-    )
+    train_stats = pd.read_hdf(dataset_dir/"train_description.h5")
     train_mean = (train_stats.loc["mean", COLUMNS_TO_STDIZE]
                   .values.astype(np.float32))
     # Hardcoded for 2 poses, TODO: generalize
     train_mean = torch.from_numpy(np.hstack(
-        [[0, 0, 0, 0], train_mean[:3], [0, 0, 0, 0], train_mean[3:], 0]
+        [[0, 0, 0, 0], train_mean[:3], [0, 0, 0, 0], train_mean[3:]]
     ))
     train_std = (train_stats.loc["std", COLUMNS_TO_STDIZE]
                  .values.astype(np.float32))
     # Hardcoded for 2 poses, TODO: generalize
     train_std = torch.from_numpy(np.hstack(
-        [[1, 1, 1, 1], train_std[:3], [1, 1, 1, 1], train_std[3:], 1]
+        [[1, 1, 1, 1], train_std[:3], [1, 1, 1, 1], train_std[3:]]
     ))
+    if args.feature_set == FeatureSet.HBPS:
+        # Add speaking_status dimension
+        train_mean = torch.cat([train_mean, torch.tensor([0])])
+        train_std = torch.cat([train_std, torch.tensor([1])])
+
     # Initialize the callbacks
     callbacks = []
     if args.skip_serialize_cb:
@@ -209,7 +197,7 @@ def main():
         logging.info("[*] Initializaing metrics computation callback")
         metrics_computer = MetricsComputer(
             out_dir, process.hparams.nposes, args.future_len, args.time_stride,
-            train_mean, train_std, args.project_rot
+            train_mean, train_std, args.feature_set, args.project_rot
         )
         callbacks.append(metrics_computer)
 

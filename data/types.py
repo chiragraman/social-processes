@@ -29,7 +29,7 @@ class ApproximatePosteriors(NamedTuple):
                            over the target points
 
     """
-    q_context: Normal
+    q_context: Normal = None
     q_target: Normal = None
 
 
@@ -64,13 +64,49 @@ class Seq2SeqPredictions(NamedTuple):
                            stochastic encoder-decoder
         posteriors      -- The approixmate posterior distribution computed
                            over the context and target points
+        encoded_rep     -- The representation of the observed sequences encoded
+                           by the sequence encoder of the stochastic enc-dec model
         deterministic   -- The deterministic encoder-decoder predictions for
                            the latent and deterministic paths
 
     """
     stochastic: Normal
     posteriors: ApproximatePosteriors
+    encoded_rep: Optional[Tensor] = None
     deterministic: Tuple[Optional[Tensor], Optional[Tensor]] = (None, None)
+
+
+class SequentialSamples(NamedTuple):
+
+    """ Represents a data sample for the Sequential Social Process
+
+    Attributes:
+        x   -- The input data tensor
+        t   -- The time steps corresponding to the data points in x
+        y   -- The labels for the data points in x
+
+    """
+    x: Tensor
+    t: Tensor
+    y: Tensor = None
+
+
+class SequentialPredictions(NamedTuple):
+
+    """ Represents a prediction from the Sequential Social Process
+
+    Attributes:
+        prediction          -- The predicted output distribution
+        spatial_posteriors  -- The approximate posteriors from the spatial
+                               process
+        temporal_posteriors -- The approximate posteriors from the temporal
+                               process
+
+    """
+
+    prediction: Normal
+    spatial_posteriors: ApproximatePosteriors
+    temporal_posteriors: ApproximatePosteriors
 
 
 class DataSplit(NamedTuple):
@@ -92,6 +128,7 @@ class ModelType(Enum):
 
     SOCIAL_PROCESS  = auto()
     NEURAL_PROCESS  = auto()
+    VAE_SEQ2SEQ = auto()
 
 
 class ComponentType(Enum):
@@ -115,3 +152,19 @@ Map for specifying which individual sequences to serialize at test.
 Maps group id to ranges of start frames of observed sequences
 """
 SerializationMap = Dict[str, Union[int, Sequence[Tuple[int]]]]
+
+
+class FeatureSet(Enum):
+
+    """ Feature set used for experiments """
+
+    HBP  = auto() # Head and Body Pose
+    HBPS   = auto() # Head and Body Pose, Speaking Status
+
+
+class BucketType(Enum):
+
+    """ Dataset attribute to choose for batch bucketing """
+
+    GROUP = auto()
+    SEQ = auto()

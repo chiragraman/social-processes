@@ -18,7 +18,7 @@ from torch import Tensor
 from torch.distributions import Normal
 from torch.nn import functional as F
 
-from common.architecture.mlp import hidden_layers_list, MLP
+from common.architecture.mlp import MLP
 from models.attention import AttenderBase
 
 class NPEncoder(nn.Module):
@@ -86,6 +86,8 @@ class ZEncoder(nn.Module):
         """ Initialize the ZEncoder """
         super().__init__()
         # Intermediate fully connected layers
+        self.ninp = ninp
+        self.nout = nout
         self.shared_layers = MLP(ninp, nhid, nhid, nlayers, dropout=dropout,
                                  act_kwargs={"inplace":"True"})
         # Pass shared representation through specialised 2-layer MLPs for

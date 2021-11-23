@@ -10,7 +10,7 @@
 
 
 import math
-from typing import Callable, Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -34,6 +34,7 @@ class EncoderRNN(nn.Module):
         self.gru = nn.GRU(ninp, nhid, nlayers, dropout=dropout)
         self.out_linear = nn.Linear(nhid, nout)
         self.hid_linear = nn.Linear(nhid, nout)
+        self.ninp = ninp
         self.nhid = nhid
         self.nout = nout
         self.nlayers = nlayers
@@ -41,8 +42,12 @@ class EncoderRNN(nn.Module):
     def forward(self, inputs: Tensor) -> Tensor:
         """ Forward pass to encode the sequence.
 
-        Returns output (seq_len, batch_size, self.nout),
-                h_n (1, batch_size, self.nout)
+        Args:
+            inputs  -- tensor (seq_len, batch_size, ninp)
+
+        Returns encoded sequence output and last hidden state of the gru
+        output  -- tensor (seq_len, batch_size, self.nout)
+        hidden  -- tensor (nlayers, batch_size, self.nout)
         """
         output, h_n = self.gru(inputs)
         output = self.out_linear(output)
@@ -552,14 +557,14 @@ class StochasticEncoderDecoderRNN(SocialSeq2SeqBase):
                                 For eg. if value is 0.75, ground truth values
                                 are used 75% of the time
 
-        Returns the future mean and variance
+        Returns the future mean and std
         future mean    -- tensor (n_samples, future_len, batch_size * npeople,
                                   data_dim)
         future sigma   -- tensor (n_samples, future_len, batch_size * npeople,
                                   data_dim)
 
         """
-        # Expand r to match the number of z samples
+        # Expand e to match the number of z samples
         # shape (nsamples, encoder.nlayers, batch*npeople, encoder.nout)
         e_reshaped = e.unsqueeze(0).expand(z.size(0), *e.size())
 
@@ -574,7 +579,7 @@ class StochasticEncoderDecoderRNN(SocialSeq2SeqBase):
         # List to store generated futures
         futures = []
 
-        # If variance is to be learned, repeat the input along the data dim
+        # If std is to be learned, repeat the input along the data dim
         data_dim = decode_start.shape[1]
         if not self.fix_variance:
             decode_start = decode_start.repeat(1, 2)
@@ -614,10 +619,7 @@ class StochasticEncoderDecoderRNN(SocialSeq2SeqBase):
                 inputs = output
                 # Teacher force the inputs for the means -
                 if torch.rand(1) < teacher_forcing and future is not None:
-                    inputs = torch.cat(
-                        (future[timestep], inputs[:, data_dim:]),
-                        dim=1
-                    )
+                    inputs = torch.cat((future[timestep], inputs[:, data_dim:]), dim=1)
 
             # Store generated sequences
             futures.append(outseqs)
@@ -660,21 +662,21 @@ class StochasticEncoderDecoderRNN(SocialSeq2SeqBase):
 
         """
         # Encode and prepare for decoding
-        _, b, p, d = samples.observed.size()
-        rep, decode_start, flat_fut = super().forward(samples)
+        _, b, p, _ = samples.observed.size()
+        encoded_rep, decode_start, flat_fut = super().forward(samples)
 
         # Combine the z and r_context tensors
         z = combine_rz(z, p, r_context)
 
         # Decode the future sequences
         future_mu, future_sigma = self._forward_decode(
-            rep, decode_start, z, samples.future_len, flat_fut, teacher_forcing
+            encoded_rep, decode_start, z, samples.future_len, flat_fut, teacher_forcing
         )
 
-        return future_mu.view(future_mu.shape[0], samples.future_len,
-                              b, p, -1),\
-               future_sigma.view(future_sigma.shape[0], samples.future_len,
-                                 b, p, -1)
+        future_mu = future_mu.view(future_mu.shape[0], samples.future_len, b, p, -1)
+        future_sigma = future_sigma.view(future_sigma.shape[0], samples.future_len, b, p, -1)
+
+        return future_mu, future_sigma, encoded_rep
 
 
 class DeterministicEncoderDecoderMLP(SocialSeq2SeqBase):
@@ -804,7 +806,7 @@ class StochasticEncoderDecoderMLP(SocialSeq2SeqBase):
         mu = decoded[..., :d]
         sigma = 0.1 + 0.9*F.softplus(decoded[..., d:])
 
-        return mu, sigma
+        return mu, sigma, encoded_rep
 
 
 # Type aliases for encoder-decoder components

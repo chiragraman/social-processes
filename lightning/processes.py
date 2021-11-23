@@ -26,12 +26,15 @@ import models.social_process as sp
 import models.neural_process as nproc
 from .builders import RecurrentBuilder, MLPBuilder
 from data.types import (
-    ApproximatePosteriors, DataSplit, Seq2SeqSamples, Seq2SeqPredictions
+    ApproximatePosteriors, ComponentType, DataSplit, FeatureSet, Seq2SeqSamples,
+    Seq2SeqPredictions
 )
 from models.attention import AttentionType, QKRepresentation, build_attender
+from models.sequential import EncoderRNN, DecoderRNN
+from models.vae_seq2seq import VariationalEncDecMLP, VariationalEncDecRNN
 from common.regularizer import OrthogonalRegularizer
 from common.utils import EnumAction
-from models.neural_process import ZEncoder
+from train.elbo import log_likelihood
 from train.loss import SocialProcessLoss, SocialAuxLoss
 
 
@@ -244,7 +247,7 @@ class SPSystemBase(AbstractCommonBase):
         return {"loss": loss, "loss_no_reg": loss_no_reg, "nll": nll,
                 "kl": kl, "aux_loss": aux}
 
-    def validation_step(self, batch: DataSplit, _) -> None:
+    def validation_step(self, batch: DataSplit, _) -> Dict:
         """ Perform an evaluation step """
         loss, nll, kl, aux = self.shared_step(batch, teacher_forcing=0)
         return {"loss": loss.detach(), "nll": nll, "kl": kl, "aux_loss": aux}
@@ -311,7 +314,7 @@ class SPSystemSocial(SPSystemBase):
     def _configure_loss(self, hparams:Namespace) -> nn.Module:
         """ Configure the loss module """
         sx, sq = hparams.homo_init
-        aux_loss = SocialAuxLoss(sx, sq, hparams.nposes)
+        aux_loss = SocialAuxLoss(sx, sq, hparams.nposes, hparams.feature_set)
         return SocialProcessLoss(aux_loss)
 
     def create_optimizer(self):
@@ -351,6 +354,64 @@ class SPSystemSocial(SPSystemBase):
                             help="initial guess for homoscedastic uncertainties "
                                  "variables(default: %(default)s)")
         return parser
+
+
+def _reshape_for_MLP(samples: Seq2SeqSamples) -> Tuple[Tensor, Optional[Tensor]]:
+    """ Reshape the observed and future tensors from Seq2Seq Samples for MLP models
+
+    The observed and future tensors are reshaped from
+    (seq_len, nsequences, npeople, data_dim) into
+    (nsequences*npeople, seq_len*data_dim)
+
+    Returns a tuple of (observed, future) tensors, future maybe None
+
+    """
+    so, n, p, d = samples.observed.size()
+    obs = samples.observed.permute(1, 2, 0, 3).contiguous().view(n*p, so*d)
+    fut = None
+    if samples.future is not None:
+        sf = samples.future.size(0)
+        fut = samples.future.permute(1, 2, 0, 3).contiguous().view(n*p, sf*d)
+    return obs, fut
+
+
+def _reshape_from_MLP(tensor: Tensor, nseq: int, npeople: int, data_dim: int):
+    """ Reshape predictions from an MLP model to expected dimensions
+
+    Tensor is reshaped from
+    (1, nsequences*npeople, seq_len*data_dim) to
+    (seq_len, nsequences, npeople, data_dim)
+    """
+    return tensor.squeeze(0).view(nseq, npeople, -1, data_dim).permute(2, 0, 1, 3)
+
+
+def _reshape_for_RNN(samples: Seq2SeqSamples) -> Tuple[Tensor, Optional[Tensor]]:
+    """ Reshape the observed and future tensors from Seq2Seq Samples for RNN models
+
+    The observed and future tensors are reshaped from
+    (seq_len, nsequences, npeople, data_dim) into
+    (seq_len, nsequences*npeople, data_dim)
+
+    Returns a tuple of (observed, future) tensors, future maybe None
+
+    """
+    so, n, p, d = samples.observed.size()
+    obs = samples.observed.view(so, n*p, d)
+    fut = None
+    if samples.future is not None:
+        sf = samples.future.size(0)
+        fut = samples.future.view(sf, n*p, d)
+    return obs, fut
+
+
+def _reshape_from_RNN(tensor: Tensor, nseq: int, npeople: int, data_dim: int):
+    """ Reshape predictions from an MLP model to expected dimensions
+
+    Tensor is reshaped from
+    (seq_len, nsequences*npeople, data_dim) to
+    (seq_len, nsequences, npeople, data_dim)
+    """
+    return tensor.view(-1, nseq, npeople, data_dim)
 
 
 class NPSystemBase(AbstractCommonBase):
@@ -397,28 +458,6 @@ class NPSystemBase(AbstractCommonBase):
         """ Configure the loss module """
         return SocialProcessLoss()
 
-    def reshape_samples(
-            self, samples: Seq2SeqSamples
-        ) -> Tuple[Tensor, Optional[Tensor]]:
-        """ Reshape the observed and future tensors from Seq2Seq Samples
-
-        The observed and future tensors are reshaped from
-        (seq_len, nsequences, npeople, data_dim) into
-        (1, nsequences*npeople, seq_len*data_dim)
-
-        Returns a tuple of (observed, future) tensors, future maybe None
-
-        """
-        so, n, p, d = samples.observed.size()
-        obs = samples.observed.permute(1, 2, 0, 3).contiguous().view(n*p, so*d)
-        obs = obs.unsqueeze(0)
-        fut = None
-        if samples.future is not None:
-            sf = samples.future.size(0)
-            fut = samples.future.permute(1, 2, 0, 3).contiguous().view(n*p, sf*d)
-            fut = fut.unsqueeze(0)
-        return obs, fut
-
     def reshape_batch(
             self, batch: DataSplit
         ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -429,9 +468,10 @@ class NPSystemBase(AbstractCommonBase):
         (1, nsequences*npeople, seq_len*data_dim)
 
         """
-        x_context, y_context = self.reshape_samples(batch.context)
-        x_target, y_target = self.reshape_samples(batch.target)
-        return (x_context, y_context, x_target, y_target)
+        x_context, y_context = _reshape_for_MLP(batch.context)
+        x_target, y_target = _reshape_for_MLP(batch.target)
+        return (x_context.unsqueeze(0), y_context.unsqueeze(0),
+                x_target.unsqueeze(0), y_target.unsqueeze(0))
 
     def forward(self, batch: DataSplit) -> Seq2SeqPredictions:
         """ Perform inference for the Social Process """
@@ -443,8 +483,8 @@ class NPSystemBase(AbstractCommonBase):
         # Reshape predicted distribution and wrap into a Seq2SeqPredictions obj
         # y_pred tensors are finally (seq_len, nsequences, npeople, data_dim)
         _, ntrg, p, d = batch.target.observed.size()
-        mu = y_pred.loc.squeeze(0).view(ntrg, p, -1, d).permute(2, 0, 1, 3)
-        sig = y_pred.scale.squeeze(0).view(ntrg, p, -1, d).permute(2, 0, 1, 3)
+        mu = _reshape_from_MLP(y_pred.loc, ntrg, p, d)
+        sig = _reshape_from_MLP(y_pred.scale, ntrg, p, d)
         # Final y_pred is supposed to be (nz_samples, seq_len, ...)
         preds = Seq2SeqPredictions(
             stochastic=Normal(mu.unsqueeze(0), sig.unsqueeze(0)),
@@ -478,6 +518,119 @@ class NPSystemBase(AbstractCommonBase):
         """ Setup optimizers for training the Social Process """
         optimizer = Adam(
             list(self.process.parameters()),
+            lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
+        )
+        return optimizer
+
+    @staticmethod
+    def add_model_specific_args(parent_parser: ArgumentParser) -> ArgumentParser:
+        """ Add args pertaining to the model and training of the process """
+        return _add_common_args(parent_parser)
+
+
+class VariationalSeq2SeqSystem(AbstractCommonBase):
+
+    """ Encapsulates a general variational seq2seq model """
+
+    def __init__(self, hparams: Namespace) -> None:
+        """ Initialize the Variational Seq2Seq module.
+
+        Args:
+            hparams -- The hyperparameters for the experiment
+
+        """
+        #### Lightning broke hparams type saving again.
+        if type(hparams) != Namespace:
+            hparams = Namespace(**hparams)
+        ############################
+        super().__init__(hparams)
+
+        # Initialize the model
+        if hparams.component == ComponentType.RNN:
+            model_cls = VariationalEncDecRNN
+            ninp = hparams.data_dim
+            nout = ninp
+            # Note that for running with the same social data, a sequence of shape
+            # (seq_len, nsequences, npeople, data_dim) is reshaped into
+            # (seq_len, nsequences*npeople, data_dim)
+            self.reshape_to_fn = _reshape_for_RNN
+            self.reshape_from_fn = _reshape_from_RNN
+        elif hparams.component == ComponentType.MLP:
+            model_cls = VariationalEncDecMLP
+            ninp = hparams.data_dim * hparams.observed_len
+            nout = hparams.data_dim * hparams.future_len
+            # Note that for running with the same social data, a sequence of shape
+            # (seq_len, nsequences, npeople, data_dim) is reshaped into
+            # (1, nsequences*npeople, seq_len*data_dim)
+            self.reshape_to_fn = _reshape_for_MLP
+            self.reshape_from_fn = _reshape_from_MLP
+        else:
+            raise ValueError("VariationalSeq2SeqSystem: Unrecognized component type")
+
+        self.model = model_cls(
+            ninp, nout, hparams.r_dim, hparams.z_dim, hparams.enc_nhid,
+            hparams.dec_nhid, hparams.nlayers, hparams.nz_layers, dropout=hparams.dropout
+        )
+
+    def compute_loss(self, preds: Seq2SeqPredictions, batch: Seq2SeqSamples) -> Tensor:
+        """ Compute the loss function """
+        loss = - log_likelihood(preds.stochastic, batch.future)
+        nll = loss.detach().clone()
+        # Appendix B of Kingma and Welling. Auto-Encoding Variational Bayes.
+        q_z = preds.posteriors.q_target # (batch_size i.e. nseqs, nlatent)
+        var = q_z.scale.pow(2)
+        kl = -0.5 * (1 + torch.log(var) - q_z.loc.pow(2) - var).sum(dim=1).mean()
+        loss += kl
+        kl = kl.detach().clone()
+        return loss, nll, kl
+
+    def forward(self, batch: Seq2SeqSamples) -> Seq2SeqPredictions:
+        """ Perform inference for the Social Process """
+        # Reshape context and target sequences of appropriate shape for the model
+
+        obs, fut = self.reshape_to_fn(batch)
+        future_len = batch.future_len
+        mu, sigma, q_z, _ = self.model(obs, future_len, fut, self.hparams.teacher_forcing)
+
+        # Reshape predicted distribution and wrap into a Seq2SeqPredictions obj
+        # predicted tensors are finally (seq_len, nsequences, npeople, data_dim)
+        _, nseq, p, d = batch.observed.size()
+        mu = self.reshape_from_fn(mu, nseq, p, d)
+        sigma = self.reshape_from_fn(sigma, nseq, p, d)
+
+        # Final y_pred is supposed to be (nz_samples, seq_len, ...)
+        preds = Seq2SeqPredictions(
+            stochastic=Normal(mu.unsqueeze(0), sigma.unsqueeze(0)),
+            posteriors=ApproximatePosteriors(q_target=q_z)
+        )
+        return preds
+
+    def shared_step(self, batch: Seq2SeqSamples) -> Tensor:
+        """ Compute the loss for a single batch """
+        preds = self.forward(batch)
+        return self.compute_loss(preds, batch)
+
+    def training_step(self, batch: Seq2SeqSamples, _) -> Tensor:
+        """ Perform a single step in the training loop """
+        loss, nll, kl = self.shared_step(batch)
+        logs = {"step_loss": loss.detach(), "step_nll": nll, "step_kl": kl}
+        self.log_dict(logs, prog_bar=True)
+        return {"loss": loss, "nll": nll, "kl": kl}
+
+    def validation_step(self, batch: DataSplit, _) -> None:
+        """ Perform an evaluation step """
+        loss, nll, kl = self.shared_step(batch.target)
+        return {"loss": loss.detach(), "nll": nll, "kl": kl}
+
+    def test_step(self, batch: DataSplit, _) -> Seq2SeqPredictions:
+        """ Perform a test step """
+        predictions = self.forward(batch.target)
+        return predictions
+
+    def create_optimizer(self):
+        """ Setup optimizers for training the VAE Seq2Seq """
+        optimizer = Adam(
+            list(self.model.parameters()),
             lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
         )
         return optimizer
