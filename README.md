@@ -57,7 +57,7 @@ If you use this repository for research, please cite
 
 ```
 @misc{raman2021social,
-      title={Social Processes: Self-Supervised Forecasting of Nonverbal Cues in Social Conversations},
+      title={Social Processes: Self-Supervised Meta-Learning over Conversational Groups for Forecasting Nonverbal Social Cues},
       author={Chirag Raman and Hayley Hung and Marco Loog},
       year={2021},
       eprint={2107.13576},
