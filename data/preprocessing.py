@@ -11,13 +11,15 @@
 
 import abc
 from math import radians
-from typing import Callable, Sequence
+from typing import Sequence
 from typing import Dict
 from typing import List
 
 import numpy as np
 import pandas as pd
-from mathutils import Quaternion, Vector, Euler
+from mathutils import Vector, Euler
+
+from common.graphics_utils import convert_loc_rh_y_down_to_z_up, convert_normals_to_quaternions
 
 
 FRAME_COL = "frame"
@@ -30,67 +32,6 @@ BASIC_FEATURES_COLUMNS = [
     "body_ty", "body_tz", "head_qw", "head_qx", "head_qy",
     "head_qz", "head_tx", "head_ty", "head_tz", "speaking"
 ]
-
-
-def convert_rh_y_up_to_z_up(vectors: np.array) -> np.array:
-    """ Convert right handed y up system to right handed z up.
-
-    This is done by rotating around the x axis, or equivalent to:
-        float y = position.Y;
-        position.Y = -position.Z;
-        position.Z = y;
-
-    Args:
-        vectors --  data in rh y up system (nframes, 3)
-
-    """
-    vectors = vectors[:, [0, 2, 1]]
-    vectors[:, 1] *= -1
-    return vectors
-
-
-def convert_rh_y_down_to_z_up(vectors: np.array) -> np.array:
-    """ Convert right handed y down system to right handed z up.
-
-    This is done by rotating around the x axis, or equivalent to:
-        float z = position.Z;
-        position.Z = -position.Y;
-        position.Y = z;
-
-    Args:
-        vectors --  data in rh -y up system (nframes, 3)
-
-    """
-    vectors = vectors[:, [0, 2, 1]]
-    vectors[:, 2] *= -1
-    return vectors
-
-
-def compute_orientation(normal: np.ndarray) -> np.ndarray:
-    """ Compute the unit quaternion orientation from the normal direction.
-
-    The quaternion in the first frame is constrained to the positive real
-    hemisphere. Additionally, the shortest path rotation is ensured between
-    each frame and the next one.
-
-    Args:
-        normal  --  The forward direction, shape (nframes, 3)
-
-    """
-    # Assume people start facing -Y with Z up. Mainly so that to_track_quat
-    # works as expected, and a side-effect bonus for help with viz
-    # This is crucial. Make sure data created in OpenGL (RH Y Up), is
-    # converted to Blender's coordinate system (RH Z Up)
-    quats = [Vector(v).to_track_quat("-Y", "Z") for v in normal]
-    # Constraint the first quaternion to the positive real hemisphere
-    # for consistency
-    if quats[0].w < 0:
-        quats[0].negate()
-    # Ensure the shortest path from each frame to the next
-    for i in range(len(quats)-1):
-        if quats[i].dot(quats[i+1]) < 0:
-            quats[i+1].negate()
-    return np.array(quats)
 
 
 def assemble_group_df(
@@ -153,15 +94,15 @@ class PanopticBasicFeatures(FeatureExtractorInterface):
         # Assert that all frames are valid
         assert body["bValid"]
         # body pose shape (nframes, 7), consisting of (quaternion, location)
-        body_normal = convert_rh_y_down_to_z_up(body["bodyNormal"].transpose())
-        body_quat = compute_orientation(body_normal)
+        body_normal = convert_loc_rh_y_down_to_z_up(body["bodyNormal"].transpose())
+        body_quat = convert_normals_to_quaternions(body_normal)
         neck_loc = body["joints19"][0:3, :].transpose() # (nframes, 3)
-        neck_loc = convert_rh_y_down_to_z_up(neck_loc) # (nframes, 3)
+        neck_loc = convert_loc_rh_y_down_to_z_up(neck_loc) # (nframes, 3)
         # head pose shape (nframes, 7)
-        head_normal = convert_rh_y_down_to_z_up(body["faceNormal"].transpose())
-        head_quat = compute_orientation(head_normal)
+        head_normal = convert_loc_rh_y_down_to_z_up(body["faceNormal"].transpose())
+        head_quat = convert_normals_to_quaternions(head_normal)
         nose_loc = body["joints19"][3:6, :].transpose() # (nframes, 3)
-        nose_loc = convert_rh_y_down_to_z_up(nose_loc)
+        nose_loc = convert_loc_rh_y_down_to_z_up(nose_loc)
         # speaking status shape (nframes, 1)
         speaking = speech["indicator"][:, None]
         # Trim features to have the same shape
@@ -231,14 +172,14 @@ class MNMBasicFeatures(FeatureExtractorInterface):
         # body pose shape (nframes, 7), consisting of (quaternion, location)
         body_normal = np.array([self._normal_for_angle(degree)
                                 for degree in raw_features["bOrient_deg"]])
-        body_quat = compute_orientation(body_normal)
+        body_quat = convert_normals_to_quaternions(body_normal)
         body_x = raw_features[["sh1X", "sh2X"]].mean(axis=1).values[:, np.newaxis] # (nframes,)
         body_y = raw_features[["sh1Y", "sh2Y"]].mean(axis=1).values[:, np.newaxis] # (nframes,)
         body_z = np.repeat(self.BODY_Z, len(body_x))[:, np.newaxis]
         # head pose shape (nframes, 7)
         head_normal = np.array([self._normal_for_angle(degree)
                                 for degree in raw_features["hOrient_deg"]])
-        head_quat = compute_orientation(head_normal)
+        head_quat = convert_normals_to_quaternions(head_normal)
         head_xy = raw_features[["headX", "headY"]].values
         head_z = np.repeat(self.HEAD_Z, len(head_xy))[:, np.newaxis]
         # Concatenate features
